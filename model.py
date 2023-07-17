@@ -31,8 +31,17 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        if config.lori:
+            rank = config.n_embd // config.n_head + config.n_head
+            self.c_attn_l = nn.Linear(config.n_embd, rank, bias = config.bias)
+            self.c_attn_r = nn.Linear(rank, 3*config.n_embd, bias = config.bias)
+            self.c_attn = None
+            # c_att = self.c_attn_r(self.c_attn_l())
+        else:
+            # key, query, value projections for all heads, but in a batch
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+            self.c_attn_l = None
+            self.c_attn_r = None
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -53,7 +62,14 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        if self.c_attn is None:
+            # low-rank implementation
+            c_attn_out = self.c_attn_r(self.c_attn_l(x))
+        else:
+            # full rank implementation
+            c_attn_out = self.c_attn(x)
+            
+        q, k, v  = c_attn_out.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -114,6 +130,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    lori: bool = False # True: low-rank implementation. False: usual full-rank transformer
+
 
 class GPT(nn.Module):
 
@@ -146,6 +164,11 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        
+    def dump_params(self):
+        print('parameters:')
+        for pnam, pval in self.named_parameters():
+            print('{0}: {1}'.format(pnam, pval.shape))
 
     def get_num_params(self, non_embedding=True):
         """
