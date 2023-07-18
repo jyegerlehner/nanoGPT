@@ -37,13 +37,18 @@ class CausalSelfAttention(nn.Module):
             self.c_attn_r = nn.Linear(rank, 3*config.n_embd, bias = config.bias)
             self.c_attn = None
             # c_att = self.c_attn_r(self.c_attn_l())
+            # output projection
+            self.c_proj = None
+            self.c_proj_l = nn.Linear(config.n_embd, rank, bias=config.bias)
+            self.c_proj_r = nn.Linear(rank, config.n_embd, bias=config.bias)
         else:
             # key, query, value projections for all heads, but in a batch
             self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
             self.c_attn_l = None
             self.c_attn_r = None
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj_l = None
+            self.c_proj_r = None
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -88,7 +93,10 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        if self.c_proj is None:
+            y = self.resid_dropout(self.c_proj_r(self.c_proj_l(y)))
+        else:
+            y = self.resid_dropout(self.c_proj(y))
         return y
 
 class MLP(nn.Module):
