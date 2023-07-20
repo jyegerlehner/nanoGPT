@@ -11,18 +11,18 @@ always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt'
+wandb_run_name = 'mini-gpt-lori-big'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
-batch_size = 64
+batch_size = 32
 block_size = 256 # context of up to 256 previous characters
 
 # baby GPT model :)
-n_layer = 6
+n_layer = 12
 n_head = 6
 n_embd = 384
-dropout = 0.0
+dropout = 0.2
 lori = True # low-rank implementation
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher

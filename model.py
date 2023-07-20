@@ -103,15 +103,34 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        if config.lori:
+            rank = config.n_embd // config.n_head + config.n_head
+            self.c_fc = None
+            self.c_fc_l = nn.Linear(config.n_embd, rank, bias=config.bias)
+            self.c_fc_r = nn.Linear(rank, 4 * config.n_embd, bias=config.bias)
+            self.c_proj_l = nn.Linear(4 * config.n_embd, rank, bias=config.bias)
+            self.c_proj_r = nn.Linear(rank, config.n_embd, bias = config.bias)
+            self.c_proj = None
+        else:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.c_fc_l = None
+            self.c_fc_r = None
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj_l = None
+            self.c_proj_r = None
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
+        if self.c_fc is None:
+            x = self.c_fc_r(self.c_fc_l(x))            
+        else:
+            x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.c_proj(x)
+        if self.c_proj is None:
+            x = self.c_proj_r(self.c_proj_l(x))            
+        else:
+            x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
