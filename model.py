@@ -36,11 +36,15 @@ class CausalSelfAttention(nn.Module):
             self.c_attn_l = nn.Linear(config.n_embd, rank, bias = config.bias)
             self.c_attn_r = nn.Linear(rank, 3*config.n_embd, bias = config.bias)
             self.c_attn = None
+            self.c_diag_q = nn.parameter.Parameter(data=torch.ones(config.n_embd))
+            self.c_diag_v = nn.parameter.Parameter(data=torch.ones(config.n_embd))
+            self.c_diag_k = nn.parameter.Parameter(data=torch.ones(config.n_embd))
             # c_att = self.c_attn_r(self.c_attn_l())
             # output projection
             self.c_proj = None
             self.c_proj_l = nn.Linear(config.n_embd, rank, bias=config.bias)
             self.c_proj_r = nn.Linear(rank, config.n_embd, bias=config.bias)
+            self.c_diag_proj = nn.parameter.Parameter(data=torch.ones(config.n_embd))
         else:
             # key, query, value projections for all heads, but in a batch
             self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -70,11 +74,15 @@ class CausalSelfAttention(nn.Module):
         if self.c_attn is None:
             # low-rank implementation
             c_attn_out = self.c_attn_r(self.c_attn_l(x))
+            q, k, v  = c_attn_out.split(self.n_embd, dim=2)
+            q = q + x @ torch.diag(self.c_diag_q)
+            k = k + x @ torch.diag(self.c_diag_k)
+            v = v + x @ torch.diag(self.c_diag_v)
         else:
             # full rank implementation
             c_attn_out = self.c_attn(x)
-            
-        q, k, v  = c_attn_out.split(self.n_embd, dim=2)
+            q, k, v  = c_attn_out.split(self.n_embd, dim=2)
+        
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -94,7 +102,9 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         if self.c_proj is None:
-            y = self.resid_dropout(self.c_proj_r(self.c_proj_l(y)))
+            outs = self.c_proj_r(self.c_proj_l(y))
+            outs = outs + y @ torch.diag(self.c_diag_proj)
+            y = self.resid_dropout(outs)
         else:
             y = self.resid_dropout(self.c_proj(y))
         return y
@@ -111,6 +121,16 @@ class MLP(nn.Module):
             self.c_proj_l = nn.Linear(4 * config.n_embd, rank, bias=config.bias)
             self.c_proj_r = nn.Linear(rank, config.n_embd, bias = config.bias)
             self.c_proj = None
+            self.c_diag1 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag2 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag3 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag4 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag_fc = torch.cat([torch.diag(self.c_diag1), torch.diag(self.c_diag2), torch.diag(self.c_diag3), torch.diag(self.c_diag4)], dim=1)
+            self.c_diag5 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag6 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag7 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag8 = nn.parameter.Parameter(torch.ones(config.n_embd))
+            self.c_diag_proj = torch.cat([torch.diag(self.c_diag5), torch.diag(self.c_diag6), torch.diag(self.c_diag7), torch.diag(self.c_diag8)], dim=0)
         else:
             self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
             self.c_fc_l = None
@@ -123,12 +143,16 @@ class MLP(nn.Module):
 
     def forward(self, x):
         if self.c_fc is None:
-            x = self.c_fc_r(self.c_fc_l(x))            
+            if self.c_diag_fc.device != x.device:
+                self.c_diag_fc = self.c_diag_fc.to(x.device)
+            x = self.c_fc_r(self.c_fc_l(x)) + x @ self.c_diag_fc 
         else:
             x = self.c_fc(x)
         x = self.gelu(x)
         if self.c_proj is None:
-            x = self.c_proj_r(self.c_proj_l(x))            
+            if self.c_diag_proj != x.device:
+                self.c_diag_proj = self.c_diag_proj.to(x.device)
+            x = self.c_proj_r(self.c_proj_l(x))  + x @ self.c_diag_proj
         else:
             x = self.c_proj(x)
         x = self.dropout(x)
