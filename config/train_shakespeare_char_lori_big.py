@@ -15,11 +15,11 @@ wandb_run_name = 'mini-gpt-lori-big'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
-batch_size = 32
+batch_size = 64
 block_size = 256 # context of up to 256 previous characters
 
 # baby GPT model :)
-n_layer = 12
+n_layer = 16
 n_head = 6
 n_embd = 384
 dropout = 0.2
@@ -27,7 +27,7 @@ lori = True # low-rank implementation
 
 learning_rate = 4e-4 # with baby networks can afford to go a bit higher
 max_iters = 20000
-lr_decay_iters = 15000 # make equal to max_iters usually
+lr_decay_iters = 20000 # make equal to max_iters usually
 min_lr = 4e-5 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit smaller because number of params per iter is small
 
