@@ -26,28 +26,75 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class LORICausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_k == 0
+        assert config.n_embd % config.n_q == 0
+        assert config.n_embd % config.n_v == 0
+        assert config.n_q == config.n_k
+        self.c_attn_q = nn.Linear(config.n_embd, config.n_head * config.n_q, bias=config.bias)
+        self.c_attn_k = nn.Linear(config.n_embd, config.n_head * config.n_k, bias=config.bias)
+        self.c_attn_v = nn.Linear(config.n_embd, config.n_head * config.n_v, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_head*config.n_v, config.n_embd, bias=config.bias)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.n_q = config.n_q
+        self.n_k = config.n_k
+        self.n_v = config.n_v
+
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        q = self.c_attn_q(x)
+        k = self.c_attn_k(x)
+        v = self.c_attn_v(x)
+
+        k = k.view(B, T, self.n_head, self.n_k).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.n_q).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.n_v).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_v * self.n_head) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        if config.lori:
-            rank = config.n_embd // config.n_head + config.n_head
-            self.c_attn_l = nn.Linear(config.n_embd, rank, bias = config.bias)
-            self.c_attn_r = nn.Linear(rank, 3*config.n_embd, bias = config.bias)
-            self.c_attn = None
-            # output projection
-            self.c_proj = None
-            self.c_proj_l = nn.Linear(config.n_embd, rank, bias=config.bias)
-            self.c_proj_r = nn.Linear(rank, config.n_embd, bias=config.bias)
-        else:
-            # key, query, value projections for all heads, but in a batch
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-            self.c_attn_l = None
-            self.c_attn_r = None
-            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-            self.c_proj_l = None
-            self.c_proj_r = None
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -66,14 +113,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        if self.c_attn is None:
-            # low-rank implementation
-            c_attn_out = self.c_attn_r(self.c_attn_l(x))
-            q, k, v  = c_attn_out.split(self.n_embd, dim=2)
-        else:
-            # full rank implementation
-            c_attn_out = self.c_attn(x)
-            q, k, v  = c_attn_out.split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -93,45 +133,58 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        if self.c_proj is None:
-            y = self.resid_dropout(self.c_proj_r(self.c_proj_l(y)))
-        else:
-            y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.c_proj(y))
         return y
+
+class LORIMLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc_1 = nn.Linear(config.n_embd, config.n_fc, bias=config.bias)
+        self.c_fc_2 = nn.Linear(config.n_fc, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_3 = nn.Linear(4 * config.n_embd, config.n_fc)
+        # Keep the c_proj naming for initialization to small weights
+        self.c_proj  = nn.Linear(config.n_fc, config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc_2(self.c_fc_1(x))
+        x = self.gelu(x)
+        x = self.c_fc_3(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if config.lori:
-            rank = config.n_embd // config.n_head + config.n_head
-            self.c_fc = None
-            self.c_fc_l = nn.Linear(config.n_embd, rank, bias=config.bias)
-            self.c_fc_r = nn.Linear(rank, 4 * config.n_embd, bias=config.bias)
-            self.c_proj_l = nn.Linear(4 * config.n_embd, rank, bias=config.bias)
-            self.c_proj_r = nn.Linear(rank, config.n_embd, bias = config.bias)
-            self.c_proj = None
-        else:
-            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-            self.c_fc_l = None
-            self.c_fc_r = None
-            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-            self.c_proj_l = None
-            self.c_proj_r = None
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        if self.c_fc is None:
-            x = self.c_fc_r(self.c_fc_l(x))
-        else:
-            x = self.c_fc(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
-        if self.c_proj is None:
-            x = self.c_proj_r(self.c_proj_l(x))
-        else:
-            x = self.c_proj(x)
+        x = self.c_proj(x)
         x = self.dropout(x)
+        return x
+
+class LORIBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = LORICausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = LORIMLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 class Block(nn.Module):
@@ -158,9 +211,20 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     lori: bool = False # True: low-rank implementation. False: usual full-rank transformer
+    # Only used for LORI:
+    n_q: int = None
+    n_k: int = None
+    n_v: int = None
+    n_fc: int = None
+
 
 
 class GPT(nn.Module):
+    def get_block(self, config):
+        if config.lori:
+            return LORIBlock(config)
+        else:
+            return Block(config)
 
     def __init__(self, config):
         super().__init__()
@@ -172,7 +236,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([self.get_block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -192,10 +256,23 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         
-    def dump_params(self):
+    def dump_params(self, config):
         print('parameters:')
         for pnam, pval in self.named_parameters():
-            print('{0}: {1}'.format(pnam, pval.shape))
+            if pnam.endswith('c_attn.weight'):
+                print('{0}: {1}, splits as:'.format(pnam, pval.shape))
+                cq, ck, cv = pval.split(config.n_embd, dim = 0)
+                U, S, V = torch.svd(cq, some=True, compute_uv=False)
+                print('     cq sv:{0}'.format(S))
+
+                U, S, V = torch.svd(ck, some=True, compute_uv=False)
+                print('     ck sv:{0}'.format(S))
+
+                U, S, V = torch.svd(cv, some=True, compute_uv=False)
+                print('     cv sv:{0}'.format(S))
+            else:
+                print('{0}: {1}'.format(pnam, pval.shape))
+                print('{0} dtype:{1}'.format(pnam, pval.dtype))
 
     def get_num_params(self, non_embedding=True):
         """
