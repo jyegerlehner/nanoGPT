@@ -63,7 +63,8 @@ lori=False
 n_q = 8
 n_k = 8
 n_v = 8
-n_fc = 16
+n_fc_bottleneck = 32
+n_fc_diagblock = 16
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -158,7 +159,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, lori=lori, n_q = n_q, n_k = n_k, n_v = n_v, n_fc = n_fc) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, lori=lori, n_q = n_q, n_k = n_k, n_v = n_v, n_fc_bottleneck = n_fc_bottleneck, n_fc_diagblock = n_fc_diagblock) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -178,6 +179,7 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -286,7 +288,7 @@ while True:
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
-            if iter_num > 0:
+            if iter_num > 0 or eval_only:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),

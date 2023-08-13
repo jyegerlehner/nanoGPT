@@ -136,25 +136,96 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class LORIMLP(nn.Module):
+# class LORI_FC(nn.Module):
+#     def __init__(self, config, n_input, n_output, n_bottleneck):
+#         super().__init__()
 
+#         # Number of blocks in the block-diagonal matrix
+#         nblocks = config.n_embd // config.n_fc_diagblock
+#         self.diag_params = nn.Parameter(torch.empty(
+#             size=(nblocks, config.n_fc_diagblock, 4*config.fc_diagblock)))
+#         self.left_ = nn.Linear(n_input, n_bottleneck)
+#         self.right_ = nn.Linear(n_bottleneck, n_output)
+#         self.gelu = nn.GELU()
+        
+#     def forward(self, x):
+#         x1 = x @ torch.block_diag(*self.diag_params)
+#         x2 = self.right_(self.left_(x))
+#         x = x1+x2
+#         x = self.gelu(x)
+#         return x
+
+class LORI_FC1(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc_1 = nn.Linear(config.n_embd, config.n_fc, bias=config.bias)
-        self.c_fc_2 = nn.Linear(config.n_fc, 4 * config.n_embd, bias=config.bias)
-        self.c_fc_3 = nn.Linear(4 * config.n_embd, config.n_fc)
-        # Keep the c_proj naming for initialization to small weights
-        self.c_proj  = nn.Linear(config.n_fc, config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        # Number of blocks in the block-diagonal matrix
+        nblocks = config.n_embd // config.n_fc_diagblock
+        self.diag_params = nn.Parameter(torch.empty(
+            size=(nblocks, config.n_fc_diagblock, 4*config.n_fc_diagblock)))
+        self.left_ = nn.Linear(config.n_embd, config.n_fc_bottleneck)
+        self.right_ = nn.Linear(config.n_fc_bottleneck, 4*config.n_embd)
+        
+    def forward(self, x):
+        x1 = x @ torch.block_diag(*self.diag_params)
+        x2 = self.right_(self.left_(x))
+        # print('FC1 x:{0} diag_params:{1} x1:{2} x2:{3}'.format(x.shape, self.diag_params.shape, x1.shape, x2.shape))
+        # print('FC1 left:{0} right:{1}'.format(self.left_.weight.shape, self.right_.weight.shape))
+        x = x1+x2
+        return x
+    
+class LORI_FC2(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # Number of blocks in the block-diagonal matrix
+        nblocks = config.n_embd // config.n_fc_diagblock
+        self.diag_params_c_proj = nn.Parameter(torch.empty(
+            size=(nblocks, 4*config.n_fc_diagblock, config.n_fc_diagblock)))
+        self.left_ = nn.Linear(4*config.n_embd, 4*config.n_fc_bottleneck)
+        self.c_proj = nn.Linear(4*config.n_fc_bottleneck, config.n_embd)
+        
+    def forward(self, x):
+        block_diag_mat = torch.block_diag(*self.diag_params_c_proj)
+        x1 = x @ block_diag_mat
+        x2 = self.c_proj(self.left_(x))
+        # print('FC2 x:{0} diag_params:{1} x1:{2} x2:{3} block diag:{4}'.format(x.shape, self.diag_params_c_proj.shape, x1.shape, x2.shape, block_diag_mat.shape))
+        # print('FC2 left:{0} c_proj:{1}'.format(self.left_.weight.shape, self.c_proj.weight.shape))
+        x = x2 + x1
+        return x
+
+class LORIMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.fc1 = LORI_FC1(config)
+        self.gelu = nn.GELU()
+        self.fc2 = LORI_FC2(config)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc_2(self.c_fc_1(x))
+        x = self.fc1(x)
         x = self.gelu(x)
-        x = self.c_fc_3(x)
-        x = self.c_proj(x)
+        x = self.fc2(x)
         x = self.dropout(x)
         return x
+
+
+# class LORIMLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.c_fc_1 = nn.Linear(config.n_embd, config.n_fc, bias=config.bias)
+#         self.c_fc_2 = nn.Linear(config.n_fc, 4 * config.n_embd, bias=config.bias)
+#         self.c_fc_3 = nn.Linear(4 * config.n_embd, config.n_fc)
+#         # Keep the c_proj naming for initialization to small weights
+#         self.c_proj  = nn.Linear(config.n_fc, config.n_embd, bias=config.bias)
+#         self.gelu    = nn.GELU()
+#         self.dropout = nn.Dropout(config.dropout)
+
+#     def forward(self, x):
+#         x = self.c_fc_2(self.c_fc_1(x))
+#         x = self.gelu(x)
+#         x = self.c_fc_3(x)
+#         x = self.c_proj(x)
+#         x = self.dropout(x)
+#         return x
 
 
 class MLP(nn.Module):
@@ -215,8 +286,8 @@ class GPTConfig:
     n_q: int = None
     n_k: int = None
     n_v: int = None
-    n_fc: int = None
-
+    n_fc_bottleneck: int = None
+    n_fc_diagblock: int = None
 
 
 class GPT(nn.Module):
@@ -250,7 +321,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if pn.endswith('c_proj.weight') or pn.endswith('c_proj'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
