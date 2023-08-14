@@ -21,6 +21,8 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import tiktoken
+import random
 
 import numpy as np
 import torch
@@ -110,16 +112,93 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+enc = tiktoken.get_encoding("gpt2")
+eot_token = enc.eot_token
+space_token = enc.encode(' ')
+
+def scan_for_eot(data, start_index, end_index):
+    found = False
+    index = start_index
+    while  index < end_index and not found:
+        if data[index] == eot_token:
+            return True
+        index = index+1
+    return False
+
+# Given a list of the start_indexes where we would like to start our block of text
+# from, find the first eot_token below and above.
+def find_bounding_eots(data, ix):
+    bounding_eots = list()
+    data_len = len(data)
+    for i in ix:
+        lower_eot_index = None
+        upper_eot_index = None
+        index = i
+        while data[index] != eot_token and index >= 0:
+            index = index - 1
+        lower_eot_index = index
+
+        index = i+1
+        while data[index] != eot_token and index < data_len:
+            index = index + 1
+        upper_eot_index = index
+        bounding_eots.append((lower_eot_index, upper_eot_index))
+        assert data[lower_eot_index] == eot_token or lower_eot_index == 0
+        assert data[upper_eot_index] == eot_token or upper_eot_index == data_len
+    return bounding_eots
+
+# Find the indices we want to take our text from, given where the eot_tokens
+# are above and below.
+def sample_indices(bounding_eots, block_size):
+    indices = list()
+    for lower_eot, upper_eot in bounding_eots:
+        text_size = upper_eot - lower_eot - 1
+        if text_size < block_size:
+            size = text_size
+        else:
+            size = block_size
+
+        upper_limit = upper_eot - size - 1
+        if upper_limit > lower_eot+1:
+            lower_index = random.randint(lower_eot+1, upper_limit)
+        else:
+            lower_index = lower_eot+1
+        upper_index = lower_index + size
+
+        assert size <= block_size
+        assert upper_index > lower_index
+        assert upper_index <= upper_eot
+        assert lower_index > lower_eot
+        assert upper_index == lower_index + block_size or \
+                upper_index - lower_index == upper_eot - lower_eot - 1
+        indices.append((lower_index, upper_index))
+    return indices
 
 # poor man's data loader
+padding_array = np.ones(block_size).astype(np.int64) * space_token
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    bounding_eots = find_bounding_eots(data, ix)
+    indices = sample_indices(bounding_eots, block_size)
+    x_stack_list = list()
+    y_stack_list = list()
+    for (start, end) in indices:
+        #     assert scan_for_eot(data, start, end) == False
+        x_tokens = data[start:end]
+        y_tokens = data[start+1:end+1]
+        if end - start < block_size:
+            pad_size = block_size - (end - start)
+            x_tokens = np.concatenate((padding_array[:pad_size], x_tokens))
+            y_tokens = np.concatenate((padding_array[:pad_size], y_tokens))
+        x_stack_list.append(torch.from_numpy(x_tokens.astype(np.int64)))
+        y_stack_list.append(torch.from_numpy(y_tokens.astype(np.int64)))
+
+    x = torch.stack([x_tokens for x_tokens in x_stack_list])
+    y = torch.stack([y_tokens for y_tokens in y_stack_list])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
