@@ -17,14 +17,13 @@ dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
+bias = True
 
 # baby GPT model :)
-n_layer = 12
+n_layer = 6
 n_head = 6
-# n_embd = 384
-n_embd = 96
-# dropout = 0.1
-dropout = 0.05
+n_embd = 384
+dropout = 0.1
 weight_decay = 1e-2
 # weight_decay = 1e-2
 
