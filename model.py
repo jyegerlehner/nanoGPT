@@ -26,67 +26,6 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class LORICausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        assert config.n_embd % config.n_k == 0
-        assert config.n_embd % config.n_q == 0
-        assert config.n_embd % config.n_v == 0
-        assert config.n_q == config.n_k
-        self.c_attn_q = nn.Linear(config.n_embd, config.n_head * config.n_q, bias=config.bias)
-        self.c_attn_k = nn.Linear(config.n_embd, config.n_head * config.n_k, bias=config.bias)
-        self.c_attn_v = nn.Linear(config.n_embd, config.n_head * config.n_v, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_head*config.n_v, config.n_embd, bias=config.bias)
-
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.n_q = config.n_q
-        self.n_k = config.n_k
-        self.n_v = config.n_v
-
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        q = self.c_attn_q(x)
-        k = self.c_attn_k(x)
-        v = self.c_attn_v(x)
-
-        k = k.view(B, T, self.n_head, self.n_k).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, self.n_q).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.n_v).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_v * self.n_head) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -110,7 +49,7 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        lori_causal_attn =   B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -136,97 +75,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-# class LORI_FC(nn.Module):
-#     def __init__(self, config, n_input, n_output, n_bottleneck):
-#         super().__init__()
-
-#         # Number of blocks in the block-diagonal matrix
-#         nblocks = config.n_embd // config.n_fc_diagblock
-#         self.diag_params = nn.Parameter(torch.empty(
-#             size=(nblocks, config.n_fc_diagblock, 4*config.fc_diagblock)))
-#         self.left_ = nn.Linear(n_input, n_bottleneck)
-#         self.right_ = nn.Linear(n_bottleneck, n_output)
-#         self.gelu = nn.GELU()
-        
-#     def forward(self, x):
-#         x1 = x @ torch.block_diag(*self.diag_params)
-#         x2 = self.right_(self.left_(x))
-#         x = x1+x2
-#         x = self.gelu(x)
-#         return x
-
-class LORI_FC1(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Number of blocks in the block-diagonal matrix
-        nblocks = config.n_embd // config.n_fc_diagblock
-        self.diag_params = nn.Parameter(torch.empty(
-            size=(nblocks, config.n_fc_diagblock, 4*config.n_fc_diagblock)))
-        self.left_ = nn.Linear(config.n_embd, config.n_fc_bottleneck)
-        self.right_ = nn.Linear(config.n_fc_bottleneck, 4*config.n_embd)
-        
-    def forward(self, x):
-        x1 = x @ torch.block_diag(*self.diag_params)
-        x2 = self.right_(self.left_(x))
-        # print('FC1 x:{0} diag_params:{1} x1:{2} x2:{3}'.format(x.shape, self.diag_params.shape, x1.shape, x2.shape))
-        # print('FC1 left:{0} right:{1}'.format(self.left_.weight.shape, self.right_.weight.shape))
-        x = x1+x2
-        return x
-    
-class LORI_FC2(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Number of blocks in the block-diagonal matrix
-        nblocks = config.n_embd // config.n_fc_diagblock
-        self.diag_params_c_proj = nn.Parameter(torch.empty(
-            size=(nblocks, 4*config.n_fc_diagblock, config.n_fc_diagblock)))
-        self.left_ = nn.Linear(4*config.n_embd, 4*config.n_fc_bottleneck)
-        self.c_proj = nn.Linear(4*config.n_fc_bottleneck, config.n_embd)
-        
-    def forward(self, x):
-        block_diag_mat = torch.block_diag(*self.diag_params_c_proj)
-        x1 = x @ block_diag_mat
-        x2 = self.c_proj(self.left_(x))
-        # print('FC2 x:{0} diag_params:{1} x1:{2} x2:{3} block diag:{4}'.format(x.shape, self.diag_params_c_proj.shape, x1.shape, x2.shape, block_diag_mat.shape))
-        # print('FC2 left:{0} c_proj:{1}'.format(self.left_.weight.shape, self.c_proj.weight.shape))
-        x = x2 + x1
-        return x
-
-class LORIMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.fc1 = LORI_FC1(config)
-        self.gelu = nn.GELU()
-        self.fc2 = LORI_FC2(config)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.gelu(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
-
-
-# class LORIMLP(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.c_fc_1 = nn.Linear(config.n_embd, config.n_fc, bias=config.bias)
-#         self.c_fc_2 = nn.Linear(config.n_fc, 4 * config.n_embd, bias=config.bias)
-#         self.c_fc_3 = nn.Linear(4 * config.n_embd, config.n_fc)
-#         # Keep the c_proj naming for initialization to small weights
-#         self.c_proj  = nn.Linear(config.n_fc, config.n_embd, bias=config.bias)
-#         self.gelu    = nn.GELU()
-#         self.dropout = nn.Dropout(config.dropout)
-
-#     def forward(self, x):
-#         x = self.c_fc_2(self.c_fc_1(x))
-#         x = self.gelu(x)
-#         x = self.c_fc_3(x)
-#         x = self.c_proj(x)
-#         x = self.dropout(x)
-#         return x
-
 
 class MLP(nn.Module):
 
@@ -242,20 +90,6 @@ class MLP(nn.Module):
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
-        return x
-
-class LORIBlock(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = LORICausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = LORIMLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
         return x
 
 class Block(nn.Module):
@@ -321,8 +155,9 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight') or pn.endswith('c_proj'):
+            if pn.endswith('c_proj.weight') or pn.endswith('c_proj.right.weight') or pn.endswith('c_proj.diag_params') or pn.endswith('fc2.right.weight') or pn.endswith('fc2.diag_params'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                print('residual init for {0}'.format(pn))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -330,20 +165,19 @@ class GPT(nn.Module):
     def dump_params(self, config):
         print('parameters:')
         for pnam, pval in self.named_parameters():
-            if pnam.endswith('c_attn.weight'):
-                print('{0}: {1}, splits as:'.format(pnam, pval.shape))
-                cq, ck, cv = pval.split(config.n_embd, dim = 0)
-                U, S, V = torch.svd(cq, some=True, compute_uv=False)
-                print('     cq sv:{0}'.format(S))
+            # if pnam.endswith('c_attn.weight'):
+            #     print('{0}: {1}, splits as:'.format(pnam, pval.shape))
+            #     cq, ck, cv = pval.split(config.n_embd, dim = 0)
+            #     U, S, V = torch.svd(cq, some=True, compute_uv=False)
+            #     print('     cq sv:{0}'.format(S))
 
-                U, S, V = torch.svd(ck, some=True, compute_uv=False)
-                print('     ck sv:{0}'.format(S))
+            #     U, S, V = torch.svd(ck, some=True, compute_uv=False)
+            #     print('     ck sv:{0}'.format(S))
 
-                U, S, V = torch.svd(cv, some=True, compute_uv=False)
-                print('     cv sv:{0}'.format(S))
-            else:
-                print('{0}: {1}'.format(pnam, pval.shape))
-                print('{0} dtype:{1}'.format(pnam, pval.dtype))
+            #     U, S, V = torch.svd(cv, some=True, compute_uv=False)
+            #     print('     cv sv:{0}'.format(S))
+            # else:
+                print('{0}: {1}, {2}'.format(pnam, pval.shape, pval.dtype))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -375,18 +209,50 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        # print('begin x is nan:{0}'.format(torch.isnan(x).any()))
+
+        transitions = list()
         for block in self.transformer.h:
+            before = torch.isnan(x).any()
             x = block(x)
+            after = torch.isnan(x).any()
+            transitions.append((before,after))
+
+        for i in range(len(transitions)):
+            before = transitions[i][0]
+            after = transitions[i][1]
+            if not before and after:
+                print('nan detected, transition {0}'.format(i))
+
+
         x = self.transformer.ln_f(x)
+        # print('late x is nan:{0}'.format(torch.isnan(x).any()))
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits_view = logits.view(-1, logits.size(-1))
+            targets_view = targets.view(-1)
+            loss = F.cross_entropy(logits_view, targets_view, ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        # if torch.isnan(nc0).any():
+        #     print('nc0 is nan')
+        # elif torch.isnan(nc1).any():
+        #     print('nc1 is nan')
+        # elif torch.isnan(nc2).any():
+        #     print('nc2 is nan')
+        # elif torch.isnan(nc3).any():
+        #     print('nc3 is nan')
+        # elif torch.isnan(nc4).any():
+        #     print('nc4 is nan')
+        # elif torch.isnan(nc5).any():
+        #     print('nc5 is nan')
+        # elif torch.isnan(nc6).any():
+        #     print('nc6 is nan')
 
         return logits, loss
 

@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 from model import GPT, GPTConfig
@@ -16,13 +15,24 @@ device = 'cuda'
 # dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
 # bias = True # do we use bias inside LayerNorm and Linear layers?
 lori=True
+# # Only for LORI:
+# n_q = 4
+# n_k = 4
+# n_v = 4
+# n_fc_bottleneck = 64
+# n_fc_diagblock = 4
+
+# For the full-rank version of LORI shakespeare
 # Only for LORI:
-n_q = 4
-n_k = 4
-n_v = 8
-n_fc_bottleneck = 32
-n_fc_diagblock = 16
+n_q = 64
+n_k = 64
+n_v = 64
+n_fc_bottleneck = 384
+n_fc_diagblock = 4
+
+
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -52,7 +62,11 @@ def load_source_model(source_dir):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    return model, checkpoint_model_args
+    source_config = checkpoint['config']
+    print('-------------------------------')
+    print('source_config:')
+    print(source_config)
+    return model, checkpoint_model_args, source_config
 
 def augment_with_bias(wts, biases):
     biases = torch.unsqueeze(biases, dim=1)
@@ -62,19 +76,23 @@ def augment_with_bias(wts, biases):
     return augmented_wts
 
 def rank_reduce_attn_value(v_attn_weight, v_attn_bias, c_proj_weight, c_proj_bias, config):
+    v_b = config.n_v * config.n_head
+
     if config.bias:
         assert False
     else:
         prod = torch.transpose(v_attn_weight, 0,1) @ torch.transpose(c_proj_weight, 0,1)
         v_U, v_S, v_V = torch.linalg.svd(prod, full_matrices = True)
-        v_attn_rr_left = v_U[:,:config.n_v] @ torch.diag(v_S[:config.n_v]) 
-        v_attn_rr_right = v_V
+        v_attn_rr_left = v_U[:,:v_b] @ torch.diag(v_S[:v_b]) 
+        v_attn_rr_right = v_V[:v_b,:]
         return v_attn_rr_left, v_attn_rr_right
 
 #  attn_params = rank_reduce_attention(c_attn_bias, c_attn_weight, layer_prefix)
 # c_attn_weight is weights of shape (3*n_embd x n_embd) = (output x input) dim
 # c_attn_bias is weights of (3*n_embd) = output dim
 def rank_reduce_attention(c_attn_bias, c_attn_weight, c_proj_weight, c_proj_bias, layer_prefix, config):
+    print('--------------config:')
+    print(config)
     assert config.n_q < target_config.n_embd
     assert config.n_k < target_config.n_embd
     assert config.n_v < target_config.n_embd
@@ -110,17 +128,26 @@ def rank_reduce_attention(c_attn_bias, c_attn_weight, c_proj_weight, c_proj_bias
     k_U, k_S, k_V = torch.linalg.svd(k_attn_aug, full_matrices = True)
     # v_U, v_S, v_V = torch.linalg.svd(v_attn_aug, full_matrices = True)
 
-    q_attn_rr_dot = q_U[:,:config.n_q] @ torch.diag(q_S[:config.n_q]) @ q_V[:config.n_q,:] @ torch.transpose(k_V[:config.n_k,:], 0,1)
+    # Bottlenecks are (per-head size) * (number of heads)
+    q_b = config.n_q * config.n_head
+    k_b = config.n_k * config.n_head
+
+    # Preserve the largest singular values in the approximation.
+    # q_attn_rr_dot = q_U[:,:q_b] @ torch.diag(q_S[:q_b]) @ q_V[:q_b,:] @ torch.transpose(k_V[:k_b,:], 0,1)
+    # q_attn_rr_dot_bias = None
+    # k_attn_rr_dot = k_U[:,:k_b] @ torch.diag(k_S[:k_b]) 
+    # k_attn_rr_dot_bias = None
+    q_attn_rr_dot = q_U[:,:q_b] @ torch.diag(q_S[:q_b]) @ q_V[:q_b,:]
     q_attn_rr_dot_bias = None
-    k_attn_rr_dot = k_U[:,:config.n_k] @ torch.diag(k_S[:config.n_k]) 
+    k_attn_rr_dot = k_U[:,:k_b] @ torch.diag(k_S[:k_b]) @ k_V[:k_b,:]
     k_attn_rr_dot_bias = None
 
     v_attn_rr_left, v_attn_rr_right = rank_reduce_attn_value(v_attn, v_attn_bias,  c_proj_weight, c_proj_bias, config)
 
-    new_attn_state_dict = {layer_prefix + 'attn.c_attn_q.weight': q_attn_rr_dot,
-     layer_prefix + 'attn.c_attn_k.weight': k_attn_rr_dot,
-     layer_prefix + 'attn.c_attn_v.weight': v_attn_rr_left,
-     layer_prefix + 'attn.c_proj.weight': v_attn_rr_right}
+    new_attn_state_dict = {layer_prefix + 'attn.c_attn_q.weight': torch.transpose(q_attn_rr_dot, 0,1),
+     layer_prefix + 'attn.c_attn_k.weight': torch.transpose(k_attn_rr_dot, 0,1),
+     layer_prefix + 'attn.c_attn_v.weight': torch.transpose(v_attn_rr_left,0,1),
+     layer_prefix + 'attn.c_proj.weight': torch.transpose(v_attn_rr_right,0,1)}
 
     return new_attn_state_dict
 
@@ -185,10 +212,14 @@ def rank_reduce_mlp(mlp_fc_wt, mlp_fc_bias, mlp_c_proj_wt, mlp_c_proj_bias, targ
     # Find the residual between block diag and mlp_c_proj_wt
     fc2_residual = mlp_c_proj_wt_transpose - torch.block_diag(*fc2_diag)
 
+    bottleneck = 4*target_config.n_fc_bottleneck
+    if bottleneck > target_config.n_embd:
+        bottleneck = target_config.n_embd
+
     # Low rank approximation to the residual
     U, S, V = torch.linalg.svd(fc2_residual, full_matrices=True)
-    fc2_left_wt = torch.transpose( U[:,:4*target_config.n_fc_bottleneck] @ torch.diag(S[:4*target_config.n_fc_bottleneck]), 0,1)
-    fc2_right_wt = torch.transpose(V[:4*target_config.n_fc_bottleneck,:], 0,1)
+    fc2_left_wt = torch.transpose( U[:,:bottleneck] @ torch.diag(S[:bottleneck]), 0,1)
+    fc2_right_wt = torch.transpose(V[:bottleneck,:], 0,1)
 
     mlp_params = {prefix + 'mlp.fc1.diag_params': fc1_diag,
                   prefix + 'mlp.fc1.left_.weight': fc1_left_wt,
@@ -248,22 +279,16 @@ def rank_reduce_mlp(mlp_fc_wt, mlp_fc_bias, mlp_c_proj_wt, mlp_c_proj_bias, targ
 #     model = GPT(gptconf)    
 
 # source_model = load_source_model('out_gpt_openai')
-source_model, source_args = load_source_model('out-shakespeare-char-lori')
+source_model, source_args, source_config = load_source_model('out-shakespeare-char')
 
 sd = source_model.state_dict()
+print('Source model state dict keys:')
+print('================')
 for key in sd.keys():
     print('{0}: {1}'.format(key, sd[key].shape))
 
 target_model_args = dict(source_args)
 source_model.eval()
-
-lori=True
-# Only for LORI:
-n_q = 6
-n_k = 6
-n_v = 6
-n_fc_bottleneck = 32
-n_fc_diagblock = 4
 
 print('bias:{0}'.format(source_args['bias']))
 
@@ -281,6 +306,8 @@ print(target_config)
 target_model = GPT(target_config)
 target_model.eval()
 
+print('Target model state dict keys:')
+print('------------------------')
 td = target_model.state_dict()
 for key in td.keys():
     print('{0}: {1}'.format(key, td[key].shape))
@@ -294,13 +321,13 @@ def maybe_assign(pname, td, sd, use_bias):
 td['transformer.wte.weight'] = sd['transformer.wte.weight']
 td['transformer.wpe.weight'] = sd['transformer.wpe.weight']
 td['lm_head.weight'] = sd['lm_head.weight']
+biases = target_model_args['bias']
 for i in range(0,target_config.n_layer):
     # Handle each layer in the net.
     sd_keys = sd.keys()
     layer_prefix = 'transformer.h.{0}.'.format(i)
     print('processing layer {0}'.format(layer_prefix))
     layer_i_params = [pn for pn in sd_keys if pn.startswith(layer_prefix)]
-    biases = target_model_args['bias']
 
     # layer norm 1
     ln1_wt = layer_prefix + 'ln_1.weight'
@@ -325,11 +352,13 @@ for i in range(0,target_config.n_layer):
     else:
         c_attn_bias = None
 
-    print('layer prefix + c_attn_wt_name:{0}'.format(layer_prefix + c_attn_wt_name))
-    print('layer i params:{0}'.format(layer_i_params))
+    if layer_prefix + c_attn_wt_name not in layer_i_params:
+        print('layer prefix:{0}'.format(layer_prefix))
+        print('c_attn_wt_name:{0}'.format(c_attn_wt_name))
+        print('not in layer_i_params')
+        print('string ={0}'.format(layer_prefix + c_attn_wt_name))
     assert layer_prefix + c_attn_wt_name in layer_i_params
     c_attn_weight = sd[layer_prefix + c_attn_wt_name]
-
     c_proj_wt_name = 'attn.c_proj.weight'
     c_proj_bias_name = 'attn.c_proj.bias'
     c_proj_weight = sd[layer_prefix + c_proj_wt_name]
@@ -374,7 +403,11 @@ for key in td.keys():
     else:
         print('{0} not found'.format(key))
 target_model.load_state_dict(td)
-torch.save(target_model, os.path.join(out_dir, 'ckpt.pt'))
+config = dict( source_config, **config)
+print('config:')
+print(config)
+checkpoint = {'model': target_model, 'config': config}
+torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
 
 

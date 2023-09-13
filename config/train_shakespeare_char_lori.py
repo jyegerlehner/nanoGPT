@@ -17,25 +17,27 @@ dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
-bias = True
+bias = False
 
 # baby GPT model :)
 n_layer = 6
 n_head = 6
 n_embd = 384
 dropout = 0.1
-weight_decay = 1e-2
 # weight_decay = 1e-2
+weight_decay = 1e-1
 
 lori = True # low-rank implementation
-n_q = 4
-n_k = 4
+# Per-head sizes of query and key
+n_q = 32
+n_k = 32
+# Per-head size of value
 n_v = 32
 
-n_fc_bottleneck = 64
+n_fc_bottleneck = 128
 n_fc_diagblock = 4
 
-learning_rate = 1e-3 # with baby networks can afford to go a bit higher
+learning_rate = 3e-4 # with baby networks can afford to go a bit higher
 max_iters = 10000
 lr_decay_iters = 10000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
@@ -45,5 +47,5 @@ warmup_iters = 100 # not super necessary potentially
         
 # on macbook also add
 # device = 'cpu'  # run on cpu only
-compile = False # do not torch compile the model
-# compile = True
+#compile = True # do not torch compile the model
+compile = True
