@@ -2,8 +2,8 @@ import numpy as np
 import torch
 import unittest
 import copy
-from LORI import make_low_rank_nn_linear, form_off_diag, LRPBD_from_matrix, LRPBD_iterated_soln, reduce_rank_causal_attn, LORICausalSelfAttention, make_LORI_FC_from_matrix, make_LORI_FC_from_module
-from model import CausalSelfAttention, GPTConfig
+from LORI import make_low_rank_nn_linear, form_off_diag, LRPBD_from_matrix, LRPBD_iterated_soln, reduce_rank_causal_attn, LORICausalSelfAttention, make_LORI_FC_from_matrix, make_LORI_FC_from_module, LORIMLP, reduce_rank_MLP
+from model import CausalSelfAttention, GPTConfig, MLP, Block
   
 
 def make_linear(arr, in_features, out_features, bias):
@@ -311,6 +311,30 @@ class TestRankReduce(unittest.TestCase):
                                      torch.block_diag(*lori_fc.diag_params), 0,1)
         np.testing.assert_allclose(original_wts, approx_wts, atol=1e-3)
 
+    def test_module_LRPBD_in_gt_out_full_2(self):
+        INPUT_SIZE = 8
+        OUTPUT_SIZE = 4
+        NEW_RANK = 8
+        BLOCK_SIZE = 2
+        
+        input = torch.Tensor(np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+
+        original = torch.nn.Linear(in_features=INPUT_SIZE, out_features=OUTPUT_SIZE, bias = False)
+        original_wts = original.state_dict()['weight']
+
+        lori_fc = make_LORI_FC_from_module(original, new_rank = NEW_RANK, block_size=BLOCK_SIZE, bias=False)
+
+        expected_output = original(input)
+        approx_output = lori_fc(input)
+        np.testing.assert_allclose(expected_output, approx_output, atol=1e-3)
+
+        # Compute what the weights of the approximated nn.Linear module would be
+        # to match the approximated weights of the LORI_FC module.
+        approx_wts = torch.transpose(torch.transpose(lori_fc.left.weight,0,1) @ torch.transpose(lori_fc.right.weight,0,1) +
+                                     torch.block_diag(*lori_fc.diag_params), 0,1)
+        np.testing.assert_allclose(original_wts, approx_wts, atol=1e-3)
+
+
     def test_module_LRPBD_out_gt_in_full(self):
         INPUT_SIZE = 4
         OUTPUT_SIZE = 8
@@ -525,51 +549,73 @@ class TestRankReduce(unittest.TestCase):
         # print('error:{0}'.format(error))
         # np.testing.assert_allclose(expected_output, approx_output, atol=1e-3)
         error = torch.mean(torch.abs(expected_output-approx_output))
-        print('error:{0}'.format(error))
         self.assertGreater(error, 0.001)
         self.assertLess(error, 1.0)
-        magnitude = torch.mean(torch.abs(expected_output))
-        print("ma output:{0}".format(magnitude))
+        # magnitude = torch.mean(torch.abs(expected_output))
+
+    def test_MLP_iterated_soln_full(self):
+        full_config = GPTConfig()
+        full_config.bias=False
+        B = 2
+        T = full_config.block_size
+        C = full_config.n_embd
+        input = torch.rand(size=(B, T, C))
+        mlp = MLP(full_config)
+        expected_output = mlp(input)
+
+        lori_config = copy.copy(full_config)
+        lori_config.lori = True
+        lori_config.n_fc_bottleneck = full_config.n_embd
+        lori_config.n_fc_diagblock = 8
+        lori_config.n_k=full_config.n_embd
+        lori_config.n_q=full_config.n_embd
+        lori_config.n_v=full_config.n_embd
+
+        lori_mlp = LORIMLP(lori_config)
+        reduce_rank_MLP(mlp, lori_mlp, lori_config)
+
+        approx_output = lori_mlp(input)
+        # print('expected output - approx output:')
+        # print(expected_output-approx_output)
+        # error = torch.linalg.matrix_norm(expected_output-approx_output)
+        # print('error:{0}'.format(error))
+        np.testing.assert_allclose(expected_output, approx_output, atol=1e-3)        
 
 
-        # error = torch.linalg.matrix_norm(residual) / torch.linalg.matrix_norm(original_wts)
-        # self.assertLess(error, 0.9)
-        # self.assertGreater(error, 0.00)
+    def test_MLP_iterated_soln_low_rank(self):
+        full_config = GPTConfig()
+        full_config.bias=False
+        B = 2
+        T = full_config.block_size
+        C = full_config.n_embd
+        input = torch.rand(size=(B, T, C))
+        mlp = MLP(full_config)
+        expected_output = mlp(input)
 
+        lori_config = copy.copy(full_config)
+        lori_config.lori = True
+        lori_config.n_fc_bottleneck = full_config.n_embd // 4
+        lori_config.n_fc_diagblock = 4
+        lori_config.n_k=full_config.n_embd // 4
+        lori_config.n_q=full_config.n_embd // 4
+        lori_config.n_v=full_config.n_embd // 4
 
+        lori_mlp = LORIMLP(lori_config)
+        reduce_rank_MLP(mlp, lori_mlp, lori_config)
 
-    # # LRPBD = low rank plus block diagonal
-    # def LRPBD_square_no_bias(self):
-    #     INPUT_SIZE = 8
-    #     OUTPUT_SIZE = 8
-    #     NEW_RANK = 2
-    #     DIAG_BLOCK_SIZE = 2
-
-    #     original = make_linear([[1.0,  0.5, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0  ],
-    #                             [0.0, -2.0, 0.0001,  0.0,  0.0, 0.0, 1.0, 0.0  ],
-    #                             [0.0,  0.0, 0.2,  0.0001,  0.0, 0.0, 0.0, 0.0  ],
-    #                             [0.0,  0.0, 0.2, -1.0,  0.0001, 0.0, 0.0, 0.0  ],
-    #                             [0.0,  0.0, 0.0,  0.0,  1.0, 0.0001, 0.0, 0.0  ],
-    #                             [0.0,  0.0, 0.0,  0.0,  0.0, 1.0, 0.0001, 0.0  ],
-    #                             [0.0001,  0.0, 0.0,  0.0,  0.0, 0.0, 1.0, 0.0001  ],
-    #                             [1.0,  0.0001, 0.0,  0.0,  0.0, 0.0, 0.0, 1.0  ]], 
-    #                             in_features=INPUT_SIZE, out_features = OUTPUT_SIZE, bias=False )
-
-    #     input = torch.Tensor( np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
-    #     full_rank_output = original(input)
-    #     low_rank_module = make_LRPBD(original, new_rank = NEW_RANK, block_size = DIAG_BLOCK_SIZE)
-    #     low_rank_output = low_rank_module(input)
-
-    #     low_rank_weights2 = low_rank_module.state_dict()['weight']
-    #     # print('low rank weights:')
-    #     # print(low_rank_weights2)
-    #     full_rank_wts = original.state_dict()['weight']
-    #     # We can expect wts to be close because condition number was so high/ ignored 
-    #     # singular values that wer so tiny.
-    #     np.testing.assert_allclose(full_rank_wts, low_rank_weights2, atol=1e-3)        
-    #     np.testing.assert_allclose(full_rank_output, low_rank_output, atol=1e-3)
-
-
+        # approx_output = lori_mlp(input)
+        # print('expected output - approx output:')
+        # print(expected_output-approx_output)
+        # error = torch.linalg.matrix_norm(expected_output-approx_output)
+        # output_mag = torch.linalg.matrix_norm(expected_output)
+        # approx_output_mag = torch.linalg.matrix_norm(approx_output)
+        # print('error:{0}, output_mag:{1} approx mag:{2}'.format(error, output_mag, approx_output_mag))
+        cos_sim = torch.nn.CosineSimilarity(dim=2)
+        sim = cos_sim(expected_output, approx_output)
+        
+        print('cos similarity"{0}'.format(sim))
+        is_greater = np.greater(sim, 0.0)
+        np.testing.assert_(is_greater.all())
 
 
 

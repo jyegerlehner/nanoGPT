@@ -6,6 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+import dataclasses
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -37,9 +38,15 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
+    model = checkpoint['model']
     if 'model_args' in checkpoint:
         print(type(checkpoint))
-        gptconf = GPTConfig(**checkpoint['model_args'])
+        # gptconf = GPTConfig(**checkpoint['model_args'])
+        conf = dataclasses.asdict(GPTConfig())
+        for k in conf.keys():
+            conf[k] = checkpoint['config'][k]
+            # conf[k] = checkpoint['model_args'][k]
+        gptconf = GPTConfig(**conf)
         model = GPT(gptconf)
         state_dict = checkpoint['model']
         unwanted_prefix = '_orig_mod.'

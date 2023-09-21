@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from model import CausalSelfAttention
+# from model import CausalSelfAttention
+from LayerNorm import LayerNorm
 
 
 def reduce_rank_linear(full_rank_wts, new_rank):
@@ -224,13 +225,24 @@ def make_LORI_FC_from_matrix(original_wts, new_rank, block_size, bias):
     input_features = original_wts.shape[1]
     output_features = original_wts.shape[0]
 
+    if new_rank > input_features:
+        new_rank = input_features
+    if new_rank > output_features:
+        new_rank = output_features
+
     # left_matrix, right_matrix, block_diag_params = LRPBD_from_matrix(wts_to_reduce, 
     #                                                                     new_rank = new_rank, 
     #                                                                     block_size=block_size)
+
     left_matrix, right_matrix, block_diag_params = LRPBD_iterated_soln(wts_to_reduce, 
                                                                        new_rank = new_rank, 
                                                                        block_size=block_size)
     lori_fc = LORI_FC(input_features=input_features, output_features=output_features, rank=new_rank, diag_blocksize=block_size, bias=bias )
+
+    lori_input_features = lori_fc.left.weight.shape[1]
+    lori_output_features = lori_fc.right.weight.shape[0]
+    assert input_features == lori_input_features
+    assert output_features == lori_output_features 
     sd = lori_fc.state_dict()
     sd['diag_params'] = block_diag_params
     sd['left.weight'] = torch.transpose(left_matrix,0,1)
@@ -250,15 +262,12 @@ def set_state(target, source):
     assert isinstance(source, type(target))
     target.load_state_dict(source.state_dict())
 
-def reduce_rank_MLP(mlp, lori_mlp, lori_config):
-    fc1 = make_LORI_FC_from_module(original=mlp.fc1, new_rank=lori_config.n_fc_bottleneck, )
-
 def reduce_rank_causal_attn(caus_attn, lori_ca, lori_config):
     assert lori_config.bias == False
     c_wts = caus_attn.state_dict()['c_attn.weight']
     assert c_wts.shape[0] == 3*c_wts.shape[1]
     assert lori_config.n_embd == c_wts.shape[1]
-    assert isinstance(caus_attn, CausalSelfAttention)
+    # assert isinstance(caus_attn, CausalSelfAttention)
     assert isinstance(lori_ca, LORICausalSelfAttention)
 
     q_attn, k_attn, v_attn = c_wts.split(lori_config.n_embd, dim=0)
@@ -285,10 +294,27 @@ def reduce_rank_causal_attn(caus_attn, lori_ca, lori_config):
     set_state(lori_ca.c_attn_k, lori_k_attn)
     set_state(lori_ca.c_attn_v, lori_v_attn)
 
-    lori_c_proj = make_LORI_FC_from_module(original=caus_attn.c_proj, new_rank=lori_config.n_fc_bottleneck, 
+    lori_c_proj = make_LORI_FC_from_module(original=caus_attn.c_proj, new_rank=lori_config.n_v, 
                                            block_size=lori_config.n_fc_diagblock, bias=lori_config.bias)
 
     set_state(lori_ca.c_proj, lori_c_proj)
+
+def reduce_rank_MLP(mlp, lori_mlp, lori_config):
+    fc1 = make_LORI_FC_from_module(original=mlp.c_fc, new_rank=lori_config.n_fc_bottleneck, block_size=lori_config.n_fc_diagblock, bias=lori_config.bias)
+    set_state(lori_mlp.fc1, fc1)
+
+    new_rank = lori_config.n_fc_bottleneck
+    if lori_config.n_embd < new_rank:
+        new_rank = lori_config.n_embd
+    fc2 = make_LORI_FC_from_module(original=mlp.c_proj, new_rank=new_rank, block_size=lori_config.n_fc_diagblock, bias=lori_config.bias)
+    set_state(lori_mlp.fc2, fc2)
+
+def reduce_rank_Block(block, lori_block, lori_config):
+    set_state(lori_block.ln_1, block.ln_1)
+    reduce_rank_causal_attn(block.attn, lori_block.attn, lori_config)
+    set_state(lori_block.ln_2, block.ln_2)
+    reduce_rank_MLP(block.mlp, lori_block.mlp, lori_config)
+
 
     # q_U, q_S, q_V = torch.linalg.svd(q_attn_aug, full_matrices = False)
     # k_U, k_S, k_V = torch.linalg.svd(k_attn_aug, full_matrices = False)
@@ -478,6 +504,7 @@ class LORI_FC(nn.Module):
 class LORIMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        assert config.n_fc_bottleneck <= config.n_embd
         self.fc1 = LORI_FC(input_features=config.n_embd, 
                            output_features=4*config.n_embd, 
                            rank=config.n_fc_bottleneck, 
@@ -486,8 +513,8 @@ class LORIMLP(nn.Module):
         self.gelu = nn.GELU()
         self.fc2 = LORI_FC(input_features=4*config.n_embd, 
                            output_features=config.n_embd, 
-                           rank=4*config.n_fc_bottleneck, 
-                           diag_blocksize=4*config.n_fc_diagblock, 
+                           rank=config.n_fc_bottleneck, 
+                           diag_blocksize=config.n_fc_diagblock, 
                            bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
